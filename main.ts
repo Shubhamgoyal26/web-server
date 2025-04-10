@@ -1,6 +1,6 @@
 import * as net from 'net';
 
-function newConn(socket) {
+function newConn(socket: net.Socket): void {
   console.log('new connection', socket.remoteAddress, socket.remotePort);
 
   socket.on('end', () => {
@@ -8,7 +8,7 @@ function newConn(socket) {
     console.log('EOF.');
   });
 
-  socket.on('data', (data) => {
+  socket.on('data', (data: Buffer) => {
     console.log('data:', data);
     socket.write(data); // echo back the data
 
