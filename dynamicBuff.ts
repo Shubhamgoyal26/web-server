@@ -2,6 +2,7 @@
 type DynBuf = {
   data: Buffer;
   length: number;
+  dataStart: number;
 };
 
 // append data to DynBuf
@@ -22,20 +23,28 @@ function bufPush(buf: DynBuf, data: Buffer): void {
 }
 
 // remove data from the front
-function bufPop(buf: DynBuf, len: number): void {
-  buf.data.copyWithin(0, len, buf.length);
-  buf.length -= len;
+function bufPop(buf: DynBuf): void {
+  buf.data.copyWithin(0, buf.dataStart, buf.length);
+  buf.length -= buf.dataStart;
+  buf.dataStart = 0;
 }
 
 function cutMessage(buf: DynBuf): null | Buffer {
   // messages are separated by '\n'
-  const idx = buf.data.subarray(0, buf.length).indexOf('\n');
+  const idx = buf.data.subarray(buf.dataStart, buf.length).indexOf('\n');
   if (idx < 0) {
     return null; // not complete
   }
   // make a copy of the message and move the remaining data to the front
-  const msg = Buffer.from(buf.data.subarray(0, idx + 1));
-  bufPop(buf, idx + 1);
+  const msg = Buffer.from(
+    buf.data.subarray(buf.dataStart, buf.dataStart + idx + 1)
+  );
+  buf.dataStart += idx + 1;
+
+  if (buf.dataStart > buf.data.length / 2) {
+    bufPop(buf);
+  }
+
   return msg;
 }
 

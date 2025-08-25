@@ -109,7 +109,7 @@ async function newConn(socket: net.Socket): Promise<void> {
 // echo server
 async function serveClient(socket: net.Socket): Promise<void> {
   const conn: TCPConn = soInit(socket);
-  const buf: DynBuf = { data: Buffer.alloc(0), length: 0 };
+  const buf: DynBuf = { data: Buffer.alloc(0), length: 0, dataStart: 0 };
 
   while (true) {
     // try to get 1 message from buffer
