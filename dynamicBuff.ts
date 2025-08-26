@@ -29,25 +29,6 @@ function bufPop(buf: DynBuf): void {
   buf.dataStart = 0;
 }
 
-function cutMessage(buf: DynBuf): null | Buffer {
-  // messages are separated by '\n'
-  const idx = buf.data.subarray(buf.dataStart, buf.length).indexOf('\n');
-  if (idx < 0) {
-    return null; // not complete
-  }
-  // make a copy of the message and move the remaining data to the front
-  const msg = Buffer.from(
-    buf.data.subarray(buf.dataStart, buf.dataStart + idx + 1)
-  );
-  buf.dataStart += idx + 1;
-
-  if (buf.dataStart > buf.data.length / 2) {
-    bufPop(buf);
-  }
-
-  return msg;
-}
-
-export { bufPush, cutMessage };
+export { bufPush, bufPop };
 
 export type { DynBuf };
