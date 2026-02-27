@@ -1,5 +1,7 @@
-import { bufPop } from './dynamicBuff.ts';
+import { bufPop, bufPush } from './dynamicBuff.ts';
 import type { DynBuf } from './dynamicBuff.ts';
+import type { TCPConn } from './socket.ts';
+import { soWrite, soRead } from './socket.ts';
 
 // the maximum length of an HTTP header
 const kMaxHeaderLen = 1024 * 8;
@@ -14,7 +16,7 @@ type HTTPReq = {
 
 // an HTTP response
 type HTTPRes = {
-  code: number;
+  code: Number;
   headers: Buffer[];
   body: BodyReader;
 };
@@ -93,15 +95,31 @@ function parseRequestLine(line: Buffer): Buffer[] {
   return [method, uri, version];
 }
 
-function validateHeader(header: Buffer): Boolean {
-  const headerNameCharRegex = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
-  const headerValueCharRegex = /[^\t\x20-\x7e\x80-\xff]/;
+function parseHeader(header: Buffer): null | Buffer[] {
   const idx = header.indexOf(':');
   if (idx < 0) {
-    return false;
+    return null;
   }
   const name = header.subarray(0, idx);
   const value = header.subarray(idx + 1);
+
+  if (name.length === 0 || value.length === 0) {
+    throw new HTTPError(400, 'bad header');
+  }
+
+  return [name, value];
+}
+
+function validateHeader(header: Buffer): Boolean {
+  const headerNameCharRegex = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
+  const headerValueCharRegex = /[^\t\x20-\x7e\x80-\xff]/;
+
+  const parsedHeader = parseHeader(header);
+  if (parseHeader == null) {
+    return false;
+  }
+  const name = parsedHeader[0];
+  const value = parsedHeader[1];
 
   if (
     name == null ||
@@ -148,5 +166,159 @@ function parseHTTPReq(data: Buffer): HTTPReq {
   };
 }
 
-export { cutMessage, HTTPError };
-export type { HTTPReq, HTTPRes };
+function fieldGet(headers: Buffer[], key: string): null | Buffer {
+  for (let i = 0; i < headers.length; i++) {
+    let parsedHeader = parseHeader(headers[i]);
+    if (parsedHeader == null) {
+      continue;
+    }
+    if (parsedHeader[0].toString().toLowerCase() === key.toLowerCase()) {
+      return parsedHeader[1];
+    }
+  }
+  return null;
+}
+
+// BodyReader from an HTTP request
+function readerFromReq(conn: TCPConn, buf: DynBuf, req: HTTPReq): BodyReader {
+  let bodyLen = -1;
+  const contentLen = fieldGet(req.headers, 'Content-Length');
+  if (contentLen) {
+    bodyLen = parseInt(contentLen.toString('latin1'), 10);
+    if (isNaN(bodyLen)) {
+      throw new HTTPError(400, 'bad content-length.');
+    }
+  }
+  const bodyAllowed = !(req.method === 'GET' || req.method === 'HEAD');
+  const chunked =
+    fieldGet(req.headers, 'Transfer-Encoding')?.equals(
+      Buffer.from('chunked')
+    ) || false;
+
+  if (!bodyAllowed && (bodyLen > 0 || chunked)) {
+    throw new HTTPError(400, 'HTTP body not allowed.');
+  }
+  if (!bodyAllowed) {
+    bodyLen = 0;
+  }
+
+  if (bodyLen >= 0) {
+    // Content-Length is present
+    return readerFromConnLength(conn, buf, bodyLen);
+  } else if (chunked) {
+    // chunked encoding
+    throw new HTTPError(501, 'TODO');
+  } else {
+    // read the rest of the connection
+    throw new HTTPError(501, 'TODO');
+  }
+}
+
+// BodyReader from a socket with a known length
+function readerFromConnLength(
+  conn: TCPConn,
+  buf: DynBuf,
+  remain: number
+): BodyReader {
+  return {
+    length: remain,
+    read: async (): Promise<Buffer> => {
+      if (remain == 0) {
+        return Buffer.from(''); // done
+      }
+      if (buf.length === 0) {
+        // try to get some data if there is none
+        const data = await soRead(conn);
+        bufPush(buf, data);
+        // expect more data!
+        throw new Error('Unexpected EOF from HTTP body');
+      }
+
+      // consume data from the buffer
+      const consume = Math.min(buf.length, remain);
+      remain -= consume;
+      const data = Buffer.from(buf.data.subarray(0, consume));
+      bufPop(buf, consume);
+      return data;
+    },
+  };
+}
+
+// a sample request handler
+async function handleReq(req: HTTPReq, body: BodyReader): Promise<HTTPRes> {
+  // act on the request URI
+  let resp: BodyReader;
+  switch (req.uri.toString('latin1')) {
+    case '/echo':
+      // http echo server
+      resp = body;
+      break;
+    default:
+      resp = readerFromMemory(Buffer.from('hello world.\n'));
+      break;
+  }
+
+  return {
+    code: 200,
+    headers: [Buffer.from('Server: my_first_http_server')],
+    body: resp,
+  };
+}
+
+// BodyReader from in-memory data
+function readerFromMemory(data: Buffer): BodyReader {
+  let done = false;
+  return {
+    length: data.length,
+    read: async (): Promise<Buffer> => {
+      if (done) {
+        return Buffer.from(''); // no more data
+      } else {
+        done = true;
+        return data;
+      }
+    },
+  };
+}
+
+function encodeHTTPResp(resp: HTTPRes): Buffer[] {
+  let responseHeaders: Buffer[] = [];
+  const statusLine = Buffer.from(`HTTP/1.1 ${resp.code} OK\r\n`);
+  responseHeaders.push(statusLine);
+  for (let i = 0; i < resp.headers.length; i++) {
+    responseHeaders.push(resp.headers[i]);
+  }
+
+  return responseHeaders;
+}
+
+// send an HTTP response through the socket
+async function writeHTTPResp(conn: TCPConn, resp: HTTPRes): Promise<void> {
+  if (resp.body.length < 0) {
+    throw new Error('TODO: chunked encoding');
+  }
+  // set the "Content-Length" field
+  console.assert(!fieldGet(resp.headers, 'Content-Length'));
+  resp.headers.push(Buffer.from(`Content-Length: ${resp.body.length}`));
+
+  // write the header
+  await soWrite(conn, encodeHTTPResp(resp));
+  // write the body
+  while (true) {
+    const data = await resp.body.read();
+    if (data.length === 0) {
+      break;
+    }
+    await soWrite(conn, data);
+  }
+}
+
+export {
+  cutMessage,
+  HTTPError,
+  handleReq,
+  readerFromReq,
+  readerFromMemory,
+  writeHTTPResp,
+};
+export type { HTTPReq, HTTPRes, BodyReader };
