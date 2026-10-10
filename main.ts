@@ -1,142 +1,81 @@
 import * as net from 'net';
-import { bufPush, cutMessage } from './dynamicBuff.ts';
 import type { DynBuf } from './dynamicBuff.ts';
-
-// A promise-based API for TCP sockets.
-type TCPConn = {
-  // the JS socket object
-  socket: net.Socket;
-  // from the 'error' event
-  err: null | Error;
-  // EOF, from the 'end' event
-  ended: boolean;
-  // the callbacks of the promise of the current read
-  reader: null | {
-    resolve: (value: Buffer) => void;
-    reject: (reason: Error) => void;
-  };
-};
-
-// create a wrapper from net.Socket
-function soInit(socket: net.Socket): TCPConn {
-  const conn: TCPConn = {
-    socket: socket,
-    err: null,
-    ended: false,
-    reader: null,
-  };
-
-  socket.on('data', (data: Buffer) => {
-    console.assert(conn.reader);
-    // pause the 'data' event until the next read.
-    conn.socket.pause();
-    // fulfill the promise of the current read.
-    conn.reader!.resolve(data);
-    conn.reader = null;
-  });
-
-  socket.on('end', () => {
-    // this also fulfills the current read.
-    conn.ended = true;
-    if (conn.reader) {
-      conn.reader.resolve(Buffer.from('')); // EOF
-      conn.reader = null;
-    }
-  });
-
-  socket.on('error', (err: Error) => {
-    // errors are also delivered to the current read.
-    conn.err = err;
-    if (conn.reader) {
-      conn.reader.reject(err);
-      conn.reader = null;
-    }
-  });
-
-  return conn;
-}
-
-function soRead(conn: TCPConn): Promise<Buffer> {
-  console.assert(!conn.reader); // no concurrent calls
-  return new Promise((resolve, reject) => {
-    // if the connection is not readable, complete the promise now.
-    if (conn.err) {
-      reject(conn.err);
-      return;
-    }
-    if (conn.ended) {
-      resolve(Buffer.from('')); // EOF
-      return;
-    }
-
-    // save the promise callbacks
-    conn.reader = { resolve: resolve, reject: reject };
-    // and resume the 'data' event to fulfill the promise later
-    conn.socket.resume();
-  });
-}
-
-function soWrite(conn: TCPConn, data: Buffer): Promise<void> {
-  console.assert(data.length > 0);
-  return new Promise((resolve, reject) => {
-    if (conn.err) {
-      reject(conn.err);
-      return;
-    }
-
-    conn.socket.write(data, (err?: Error) => {
-      if (err) {
-        reject(err);
-      } else {
-        resolve();
-      }
-    });
-  });
-}
+import type { HTTPReq, HTTPRes, BodyReader } from './http.ts';
+import type { TCPConn } from './socket.ts';
+import { bufPush } from './dynamicBuff.ts';
+import {
+  cutMessage,
+  HTTPError,
+  handleReq,
+  readerFromMemory,
+  readerFromReq,
+  writeHTTPResp,
+} from './http.ts';
+import { soInit, soRead } from './socket.ts';
 
 async function newConn(socket: net.Socket): Promise<void> {
   console.log('new connection', socket.remoteAddress, socket.remotePort);
+  const conn: TCPConn = soInit(socket);
 
   try {
-    await serveClient(socket);
+    await serveClient(conn);
   } catch (exc) {
     console.log('exception:', exc);
+    if (exc instanceof HTTPError) {
+      // intended to send an error response
+      const resp: HTTPRes = {
+        code: exc.code,
+        headers: [],
+        body: readerFromMemory(Buffer.from(exc.message + '\n')),
+      };
+      try {
+        await writeHTTPResp(conn, resp);
+      } catch (exc) {
+        /* ignore */
+      }
+    }
   } finally {
     socket.destroy();
   }
 }
 
 // echo server
-async function serveClient(socket: net.Socket): Promise<void> {
-  const conn: TCPConn = soInit(socket);
+async function serveClient(conn: TCPConn): Promise<void> {
   const buf: DynBuf = { data: Buffer.alloc(0), length: 0, dataStart: 0 };
 
   while (true) {
     // try to get 1 message from buffer
-    const msg: null | Buffer = await cutMessage(buf);
+    const msg: null | HTTPReq = await cutMessage(buf);
     if (!msg) {
       // need more data
       const data = await soRead(conn);
       bufPush(buf, data);
       // EOF?
+      if (data.length === 0 && buf.length === 0) {
+        return; // no more requests
+      }
       if (data.length === 0) {
-        console.log('end connection');
-        return;
+        throw new HTTPError(400, 'Unexpected EOF');
       }
       // got some data, try it again.
       continue;
     }
 
     // process the message and send the response
-    if (msg.equals(Buffer.from('quit\n'))) {
-      await soWrite(conn, Buffer.from('Bye.\n'));
-      socket.destroy();
+    const reqBody: BodyReader = readerFromReq(conn, buf, msg);
+    const res: HTTPRes = await handleReq(msg, reqBody);
+    await writeHTTPResp(conn, res);
+
+    // close the connection for HTTP/1.0
+    if (msg.version === '1.0') {
       return;
-    } else {
-      const reply = Buffer.concat([Buffer.from('Echo: '), msg]);
-      await soWrite(conn, reply);
     }
-  }
+
+    //make sure that the request body is consumed completely
+    while ((await reqBody.read()).length > 0) {
+      /* empty */
+    }
+  } // loop for IO
 }
 
 let server = net.createServer({
